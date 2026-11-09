@@ -391,6 +391,7 @@ def _pll_reset_session(session_key, level):
     Pyodide's `globals.get(...)`) remains valid. `__pll_level__` records the
     file's level, for the checks made while its code runs, whenever that is.
     """
+    _pll_let_go()
     g = _pll_get_session(session_key)
     g.clear()
     g.update(_pll_initial_globals)

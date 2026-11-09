@@ -231,8 +231,26 @@ class _PllPartsContract(_PllContract):
 
     leaf = False
 
+    def __init__(self, written, level=None):
+        super().__init__(written)
+        self.accepted = _PllAccepted()
+        self.unchanging = _PLL_UNCHANGING_THERE if level in _PLL_TEACHING_LEVELS else _PLL_UNCHANGING
+
     def accepts(self, value):
         return _pll_witness(self, value) is None
+
+    def watched(self, value):
+        """Whether nothing can change `value`'s parts unseen, so that its
+        check is remembered. A file at another level can still change a list
+        that a teaching level's contract checked."""
+        return type(value) in self.unchanging
+
+
+#: The containers whose parts can't change, by exact type - a subclass can
+#: give other items each time - and with them, where a contract is written at
+#: a teaching level, those such a level refuses to change in place.
+_PLL_UNCHANGING = frozenset((tuple, frozenset, str, bytes, range))
+_PLL_UNCHANGING_THERE = _PLL_UNCHANGING | {list, dict, set}
 
 
 def _pll_parts(contract, parts, step):
@@ -394,8 +412,8 @@ class _PllItemsContract(_PllPartsContract):
     mean copying it - and a change made to the container later is not
     checked at all."""
 
-    def __init__(self, kind, item, written, ordered):
-        super().__init__(written)
+    def __init__(self, kind, item, written, ordered, level):
+        super().__init__(written, level)
         self.kind = kind
         self.item = item
         self.ordered = ordered
@@ -443,8 +461,8 @@ class _PllItemsContract(_PllPartsContract):
 class _PllMappingContract(_PllPartsContract):
     """`dict[K, V]`: every key and every value, as the dictionary crosses."""
 
-    def __init__(self, kind, key, value, written):
-        super().__init__(written)
+    def __init__(self, kind, key, value, written, level):
+        super().__init__(written, level)
         self.kind = kind
         self.key = key
         self.value = value
@@ -562,14 +580,93 @@ class _PllClassOfContract(_PllContract):
 #: contains itself must not start again.
 _PLL_CHECKING = set()
 
+#: How many fields of checked dataclasses have been set: what a contract
+#: accepted before the latest may not hold now.
+_pll_field_writes = 0
+
+#: Moves whenever a check relies on what may not last - a value that
+#: contains itself, a container, a value PLL does not see change - so that
+#: the check is not remembered.
+_pll_unsure = 0
+
+
+def _pll_field_written():
+    global _pll_field_writes, _pll_unsure
+    _pll_field_writes += 1
+    _pll_unsure += 1
+
+
+def _pll_watched(value):
+    """Whether every change to `value`'s fields goes through PLL: its class
+    sets and deletes them through PLL, or is a frozen dataclass's own."""
+    cls = type(value)
+    if id(value) in _PLL_CONSTRUCTING:
+        return False
+    if cls.__setattr__ is _pll_checked_setattr and cls.__delattr__ is _pll_checked_delattr:
+        return True
+    made = next((klass for klass in cls.__mro__ if "__dataclass_params__" in vars(klass)), None)
+    return (
+        made is not None and made.__dataclass_params__.frozen
+        and cls.__setattr__ is vars(made).get("__setattr__") and cls.__delattr__ is vars(made).get("__delattr__")
+    )
+
+
+class _PllAccepted:
+    """The values a contract has accepted, by identity, until the next field
+    write: held weakly where they can be, and otherwise - a list, a tuple -
+    the last `_PLL_HELD` of them held as they are."""
+
+    __slots__ = ("refs", "held", "writes", "sweep", "__weakref__")
+
+    def __init__(self):
+        self.refs, self.held, self.writes, self.sweep = {}, {}, _pll_field_writes, 64
+
+    def __contains__(self, value):
+        if self.writes != _pll_field_writes:
+            self.refs.clear()
+            self.held.clear()
+            self.writes = _pll_field_writes
+        ref = self.refs.get(id(value))
+        if ref is not None:
+            return ref() is value
+        return id(value) in self.held and self.held[id(value)] is value
+
+    def add(self, value):
+        if not type(value).__weakrefoffset__:
+            _PLL_HOLDING.add(self)
+            self.held[id(value)] = value
+            if len(self.held) > _PLL_HELD:
+                del self.held[next(iter(self.held))]
+            return
+        self.refs[id(value)] = _pll_weakref.ref(value)
+        if len(self.refs) >= self.sweep:
+            self.refs = {key: ref for key, ref in self.refs.items() if ref() is not None}
+            self.sweep = 2 * len(self.refs) + 64
+
+
+#: How many values that cannot be held weakly a contract remembers.
+_PLL_HELD = 4
+
+#: The memories holding values as they are, which a contract that outlives
+#: its run - an assignment's (`_PLL_MADE`) - would keep alive.
+_PLL_HOLDING = _pll_weakref.WeakSet()
+
+
+def _pll_let_go():
+    """At the start of a run: no memory holds an earlier run's values."""
+    for accepted in list(_PLL_HOLDING):
+        accepted.held.clear()
+    _PLL_HOLDING.clear()
+
+
 class _PllGoing:
-    """For `_pll_witness`: a contract's parts being checked on a value, and
-    what is left of them."""
+    """For `_pll_witness`: a contract's parts being checked on a value - what
+    is left of them, and what to note once they all hold."""
 
-    __slots__ = ("parts", "contract", "value", "at", "key")
+    __slots__ = ("parts", "contract", "value", "at", "sure", "key")
 
-    def __init__(self, parts, contract, value, at, key):
-        self.parts, self.contract, self.value, self.at, self.key = parts, contract, value, at, key
+    def __init__(self, parts, contract, value, at, sure, key):
+        self.parts, self.contract, self.value, self.at, self.sure, self.key = parts, contract, value, at, sure, key
 
 
 class _PllTrying:
@@ -616,6 +713,7 @@ def _pll_witness(contract, value):
     met again inside itself under the same contract is taken as accepted;
     one met again under ever new ones (`rest: "Node[list[T]]"`) is as deep
     as Python goes."""
+    global _pll_unsure
     frames, around, limit = [], None, _sys.getrecursionlimit()
     task, at, held = (contract, value), None, None
     try:
@@ -631,15 +729,22 @@ def _pll_witness(contract, value):
                     else:
                         frame = _PllTrying(contract, value, at)
                 elif (id(value), id(contract)) in _PLL_CHECKING:
+                    _pll_unsure += 1
+                    held = True
+                elif value in contract.accepted:
                     held = True
                 else:
-                    parts = contract.parts(value)
+                    sure, parts = _pll_unsure, contract.parts(value)
+                    if parts is not None and not contract.watched(value):
+                        _pll_unsure += 1
                     if parts is None:
                         held = (contract, value, at)
                     elif parts == ():
                         held = True
+                        if _pll_unsure == sure:
+                            contract.accepted.add(value)
                     else:
-                        frame = _PllGoing(iter(parts), contract, value, at, (id(value), id(contract)))
+                        frame = _PllGoing(iter(parts), contract, value, at, sure, (id(value), id(contract)))
                 if frame is not None:
                     frames.append(frame)
                     if around is None and len(frames) > limit:
@@ -683,6 +788,8 @@ def _pll_witness(contract, value):
                         around = None
                 if isinstance(frame, _PllGoing):
                     _PLL_CHECKING.discard(frame.key)
+                    if held is True and _pll_unsure == frame.sure:
+                        frame.contract.accepted.add(frame.value)
     finally:
         for frame in frames:
             if isinstance(frame, _PllGoing):
@@ -793,6 +900,9 @@ class _PllDataContract(_PllPartsContract):
 
     def shaped(self, value):
         return isinstance(value, self.cls)
+
+    def watched(self, value):
+        return _pll_watched(value)
 
     def parts(self, value):
         if not isinstance(value, self.cls):
@@ -1630,12 +1740,12 @@ def _pll_compile(annotation, written, namespace, level, typevars=None, forced=Fa
         target = args[0] if args else None
         return _PllClassOfContract(target if isinstance(target, type) else None, text)
     if origin in _PLL_ITEMS:
-        return _PllItemsContract(origin, part(args[0]) if args else _PLL_ANY, text, _PLL_ITEMS[origin])
+        return _PllItemsContract(origin, part(args[0]) if args else _PLL_ANY, text, _PLL_ITEMS[origin], level)
     if origin in _PLL_MAPPINGS:
         key, value = (part(args[0]), part(args[1])) if len(args) == 2 else (_PLL_ANY, _PLL_ANY)
         if origin is _pll_collections.Counter:
             key, value = (part(args[0]) if args else _PLL_ANY), _PllClassContract(int, "int", level)
-        return _PllMappingContract(origin, key, value, text)
+        return _PllMappingContract(origin, key, value, text, level)
     if isinstance(origin, type):
         if args and _pll_dataclasses.is_dataclass(origin) and getattr(origin, "__type_params__", ()):
             return _pll_data_contract(origin, args, text, level, part, table)

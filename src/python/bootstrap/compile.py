@@ -986,7 +986,13 @@ def _pll_checked_setattr(self, name, value):
         contract = contracts.get(name) if contracts else None
         if contract is not None:
             _pll_check_field(self, type(self), name, value, contract, frame, contracts, assigned=True)
+        _pll_field_written()
     object.__setattr__(self, name, value)
+
+
+def _pll_checked_delattr(self, name):
+    _pll_field_written()
+    object.__delattr__(self, name)
 
 
 def _pll_refuse_field(instance, name, level):
@@ -1050,6 +1056,9 @@ def _pll_check_dataclass_fields(cls):
     original = cls.__init__
 
     def __init__(self, *args, **kwargs):
+        if getattr(self, "__dict__", None) or any(hasattr(self, slot) for slot in getattr(cls, "__slots__", ())):
+            # Made before: this changes its fields.
+            _pll_field_written()
         _PLL_CONSTRUCTING.add(id(self))
         try:
             original(self, *args, **kwargs)
@@ -1069,6 +1078,8 @@ def _pll_check_dataclass_fields(cls):
     params = getattr(cls, "__dataclass_params__", None)
     if cls.__setattr__ is object.__setattr__ and not (params is not None and params.frozen):
         cls.__setattr__ = _pll_checked_setattr
+    if cls.__delattr__ is object.__delattr__:
+        cls.__delattr__ = _pll_checked_delattr
     return cls
 
 

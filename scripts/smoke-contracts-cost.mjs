@@ -154,5 +154,109 @@ if (section(3, "a generic function's copy of a value is made however deep the va
   console.log("    1200 cells copied for a generic function");
 }
 
+if (section(4, "a value a contract accepted is not checked again")) {
+  linear("a recursive function over Node[int]", (n) => lines(...NODE, ...BUILD, ...LENGTH, `print(length(build(${n})))`), 100, 200);
+  linear(
+    "building Node[int] by consing",
+    (n) => lines(...NODE, "def build(k: int) -> Node[int] | None:", "    return None if k == 0 else Node(k, build(k - 1))", "", `print(build(${n}) is not None)`),
+    100,
+    200,
+  );
+  // A field set, or deleted, after the check is checked again.
+  const changed = (change) =>
+    ran(lines(...NODE, ...LENGTH, "l = Node(1, Node(2, None))", "print(length(l))", change, "print(length(l))"), "advanced");
+  for (const change of ['l.rest.first = "x"', "del l.rest.first"]) {
+    const after = changed(change);
+    expect(after.stdout === "2\n" && after.error?.errorType === "TypeMismatch", `after \`${change}\`: ${after.stdout} ${after.error?.message}`);
+  }
+  // A list inside one is read again each time: it can change unseen.
+  const listed = ran(
+    lines(
+      "@dataclass",
+      "class Box[T]:",
+      "    item: T",
+      "",
+      "def size(b: Box[list[int]]) -> int:",
+      "    return len(b.item)",
+      "",
+      "b = Box([1])",
+      "print(size(b))",
+      'b.item.append("x")',
+      "print(size(b))",
+    ),
+    "advanced",
+  );
+  expect(listed.stdout === "1\n" && listed.error?.errorType === "TypeMismatch", `a list changed in place: ${listed.stdout} ${listed.error?.message}`);
+  // Made again by its own `__init__`, or changed through a subclass of a
+  // frozen one that lets it: seen too.
+  const BOX = ["@dataclass", "class Box[T]:", "    item: T", "", "    def reset(self, item):", "        self.__init__(item)", ""];
+  const TAKE = ["def take(b: Box[int]) -> int:", "    return 0", ""];
+  const reinit = ran(lines(...BOX, ...TAKE, "b = Box(1)", "print(take(b))", 'b.reset("s")', "print(take(b))"), "advanced");
+  expect(reinit.stdout === "0\n" && reinit.error?.errorType === "TypeMismatch", `made again: ${reinit.stdout} ${reinit.error?.message}`);
+  const loose = ran(
+    lines(
+      "@dataclass(frozen=True)",
+      "class Box[T]:",
+      "    item: T",
+      "",
+      "class Loose(Box):",
+      "    def __setattr__(self, name, value):",
+      "        object.__setattr__(self, name, value)",
+      "",
+      ...TAKE,
+      "b = Loose(1)",
+      "print(take(b))",
+      'b.item = "s"',
+      "print(take(b))",
+    ),
+    "advanced",
+  );
+  expect(loose.stdout === "0\n" && loose.error?.errorType === "TypeMismatch", `a frozen one let loose: ${loose.stdout} ${loose.error?.message}`);
+  console.log("    each cell checked once; a change to one is seen");
+}
+
+if (section(5, "where nothing can change it, a list checked once is not walked again")) {
+  linear(
+    "a helper given the list in a loop",
+    (n) =>
+      lines(
+        "def item(l: list[int], i: int) -> int:",
+        "    return l[i]",
+        "",
+        "def total(l: list[int]) -> int:",
+        "    s = 0",
+        "    for i in range(len(l)):",
+        "        s = s + item(l, i)",
+        "    return s",
+        "",
+        `print(total(list(range(${n}))))`,
+      ),
+    100,
+    200,
+    "intermediate",
+  );
+  // Where a list can change, it is checked again.
+  const changed = ran(
+    lines("def total(l: list[int]) -> int:", "    return len(l)", "", "xs = [1, 2]", "print(total(xs))", 'xs.append("x")', "print(total(xs))"),
+    "advanced",
+  );
+  expect(changed.stdout === "2\n" && changed.error?.errorType === "TypeMismatch", `a list changed at advanced: ${changed.stdout} ${changed.error?.message}`);
+  // None is not a list that was remembered.
+  const none = ran(lines("def size(l: list[int]) -> int:", "    return 0", "", "print(size([1]))", "print(size(None))"), "intermediate");
+  expect(none.stdout === "0\n" && none.error?.errorType === "TypeMismatch", `None as a list: ${none.stdout} ${none.error?.errorType}`);
+  // The next run lets go of an earlier run's lists.
+  ran(lines("xs: list[int] = [1, 2, 3]", "print(len(xs))"), "intermediate", "cost-held");
+  ran(lines("print(0)"), "intermediate", "cost-held");
+  const held = pyodide.runPython("sum(len(accepted.held) for accepted in globals().get('_PLL_HOLDING', ()))");
+  expect(held === 0, `values still held after the next run: ${held}`);
+  // A teaching level doesn't keep a deque from changing.
+  const deque = ran(
+    lines("from collections import deque", "", "def size(d: deque[int]) -> int:", "    return len(d)", "", "d = deque([1])", "print(size(d))", 'd.append("x")', "print(size(d))"),
+    "intermediate",
+  );
+  expect(deque.stdout === "1\n" && deque.error?.errorType === "TypeMismatch", `a deque changed at intermediate: ${deque.stdout} ${deque.error?.message}`);
+  console.log("    each list checked once at intermediate; checked again where it can change");
+}
+
 console.log(passed() ? "\nsmoke-contracts-cost: ok" : "\nsmoke-contracts-cost: FAILED");
 if (!passed()) process.exitCode = 1;
