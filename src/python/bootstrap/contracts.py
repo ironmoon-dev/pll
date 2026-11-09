@@ -618,6 +618,8 @@ class _PllLaterContract(_PllContract):
         super().__init__(written)
         self._make = make
         self._made = None
+        # A type that names itself reaches this again while asked.
+        self._visiting = False
         # The type variables a call seals in it, where that is known before
         # it is made: a generic type alias's arguments say.
         self._mentions = mentions
@@ -652,7 +654,13 @@ class _PllLaterContract(_PllContract):
     def variables_in(self):
         if self._mentions is not None:
             return self._mentions
-        return self.made().variables_in()
+        if self._visiting:
+            return frozenset()
+        self._visiting = True
+        try:
+            return self.made().variables_in()
+        finally:
+            self._visiting = False
 
     def is_variable(self):
         return self.made().is_variable()
@@ -1179,13 +1187,14 @@ class _PllDefinition:
         hints = self.annotations()
         namespace = self.function.__globals__
         typevars = self._type_variables(hints, namespace)
+        table = {}
 
         def made(name):
             if name not in hints:
                 return _PLL_ANY
             written = self.written.get(name)
             try:
-                return _pll_compile(hints[name], written, namespace, self.level, typevars, forced=True)
+                return _pll_compile(hints[name], written, namespace, self.level, typevars, forced=True, table=table)
             except _PllUnresolved as unresolved:
                 _pll_not_a_type(
                     unresolved.reason, written or _pll_type_text(hints[name]), self.party,
@@ -1343,7 +1352,7 @@ _PLL_MAPPINGS = (
 )
 
 
-def _pll_compile(annotation, written, namespace, level, typevars=None, forced=False):
+def _pll_compile(annotation, written, namespace, level, typevars=None, forced=False, table=None):
     """The contract `annotation` makes. `written` is how the program wrote
     it, or None for its own text; `namespace` is where a name in quotes is
     looked up; `typevars` is what each type parameter stands for, inside a
@@ -1351,16 +1360,23 @@ def _pll_compile(annotation, written, namespace, level, typevars=None, forced=Fa
 
     `forced` makes a name in quotes now rather than when first checked: a
     `def`'s annotations are made at its first call, which is late enough.
+    `table` is the contracts made so far from the annotation this one is
+    part of (`_pll_once`).
     """
     typevars = typevars or {}
+    table = {} if table is None else table
     text = written if written else _pll_type_text(annotation, typevars)
     if isinstance(annotation, str) or isinstance(annotation, _pll_typing.ForwardRef):
         quoted = annotation if isinstance(annotation, str) else annotation.__forward_arg__
 
         def resolved():
-            return _pll_compile(_pll_contract_resolve(quoted, namespace, typevars), text, namespace, level, typevars, forced)
+            return _pll_compile(
+                _pll_contract_resolve(quoted, namespace, typevars), text, namespace, level, typevars, forced, table
+            )
 
-        return resolved() if forced else _PllLaterContract(resolved, text)
+        if forced:
+            return resolved()
+        return _pll_once(table, ("quoted", quoted, namespace, typevars), text, level, lambda: _PllLaterContract(resolved, text))
     if annotation is None or annotation is type(None):
         return _PllNoneContract("None")
     if annotation is _pll_typing.Any or annotation is object:
@@ -1373,32 +1389,38 @@ def _pll_compile(annotation, written, namespace, level, typevars=None, forced=Fa
         # Any other stands for any type.
         return typevars.get(annotation, _PllAnyContract(text))
     if isinstance(annotation, _pll_typing.TypeAliasType):
-        return _PllLaterContract(
-            lambda: _pll_compile(annotation.__value__, text, namespace, level, typevars), text
+        return _pll_once(
+            table, ("alias", annotation, namespace, typevars), text, level,
+            lambda: _PllLaterContract(
+                lambda: _pll_compile(annotation.__value__, text, namespace, level, typevars, table=table), text
+            ),
         )
     if isinstance(annotation, _pll_typing.NewType):
-        return _pll_compile(annotation.__supertype__, text, namespace, level, typevars)
+        return _pll_compile(annotation.__supertype__, text, namespace, level, typevars, table=table)
     origin = _pll_typing.get_origin(annotation)
     args = _pll_typing.get_args(annotation)
 
     def part(arg):
-        return _pll_compile(arg, None, namespace, level, typevars)
+        return _pll_compile(arg, None, namespace, level, typevars, table=table)
 
     if origin is _pll_typing.Union or origin is _pll_types.UnionType:
         return _PllUnionContract([part(arg) for arg in args], text)
     if origin is _pll_typing.Literal:
         return _PllLiteralContract(args, text)
     if origin is _pll_typing.Annotated:
-        return _pll_compile(args[0], text, namespace, level, typevars)
+        return _pll_compile(args[0], text, namespace, level, typevars, table=table)
     if origin in (_pll_typing.ClassVar, _pll_typing.Final):
-        return _pll_compile(args[0], text, namespace, level, typevars) if args else _PllAnyContract(text)
+        return _pll_compile(args[0], text, namespace, level, typevars, table=table) if args else _PllAnyContract(text)
     if isinstance(origin, _pll_typing.TypeAliasType):
         bound = dict(typevars)
         given = [part(arg) for arg in args]
         bound.update(zip(origin.__type_params__, given))
-        return _PllLaterContract(
-            lambda: _pll_compile(origin.__value__, text, namespace, level, bound), text,
-            frozenset().union(*(contract.variables_in() for contract in given)),
+        return _pll_once(
+            table, ("alias", origin, namespace, bound), text, level,
+            lambda: _PllLaterContract(
+                lambda: _pll_compile(origin.__value__, text, namespace, level, bound, table=table), text,
+                frozenset().union(*(contract.variables_in() for contract in given)),
+            ),
         )
     if origin is _pll_abc.Callable:
         return _pll_callable_contract(args, text, part)
@@ -1422,7 +1444,7 @@ def _pll_compile(annotation, written, namespace, level, typevars=None, forced=Fa
         return _PllMappingContract(origin, key, value, text)
     if isinstance(origin, type):
         if args and _pll_dataclasses.is_dataclass(origin) and getattr(origin, "__type_params__", ()):
-            return _pll_data_contract(origin, args, text, level, part)
+            return _pll_data_contract(origin, args, text, level, part, table)
         # A collection that cannot be gone through twice (an iterator), or a
         # class that is generic in some other way: the class alone.
         return _PllClassContract(origin, text, level)
@@ -1446,19 +1468,42 @@ def _pll_callable_contract(args, text, part):
     return _PllFunctionContract(params, part(result), text)
 
 
-def _pll_data_contract(cls, args, text, level, part):
+def _pll_data_contract(cls, args, text, level, part, table):
     """`Leaf[float]`: the dataclass `Leaf` with its `T` as `float`."""
     given = [part(arg) for arg in args]
     bound = dict(zip(cls.__type_params__, given))
     namespace = _PLL_CLASS_NAMESPACES.get(cls) or vars(_sys.modules.get(cls.__module__, _sys))
 
     def fields():
-        made = {}
-        for field in _pll_dataclasses.fields(cls):
-            made[field.name] = _pll_compile(field.type, None, namespace, level, bound)
-        return made
+        return {
+            field.name: _pll_compile(field.type, None, namespace, level, bound, table=table)
+            for field in _pll_dataclasses.fields(cls)
+        }
 
-    return _PllDataContract(cls, fields, text, frozenset().union(*(contract.variables_in() for contract in given)))
+    return _pll_once(
+        table, ("data", cls, namespace, bound), text, level,
+        lambda: _PllDataContract(cls, fields, text, frozenset().union(*(contract.variables_in() for contract in given))),
+    )
+
+
+def _pll_once(table, made_from, text, level, make):
+    """The contract `make` makes from `made_from` - what it is (`kind`), the
+    object (a name in quotes, by its text), the namespace it is read in and
+    its type variables' contracts - made once in `table`. A table is one
+    annotation's, made where it is read - a `def`, a class's fields, an
+    assignment - so a type that names itself (a generic dataclass, a type
+    alias, a name in quotes) is one contract there, not one more for each
+    level of a value, and a name is read in the run that wrote it. Its key
+    holds identities; the table keeps what they are of alive."""
+    kind, of, namespace, bound = made_from
+    key = (
+        kind, of if isinstance(of, str) else id(of), id(namespace),
+        tuple((name, id(contract)) for name, contract in bound.items()), text, level,
+    )
+    made = table.get(key)
+    if made is None:
+        made = table[key] = make()
+    return made
 
 
 def _pll_contract_resolve(quoted, namespace, typevars):

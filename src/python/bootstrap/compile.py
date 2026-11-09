@@ -1038,12 +1038,12 @@ def _pll_check_dataclass_fields(cls):
     _PLL_CLASS_NAMESPACES[cls] = namespace
     level = namespace.get("__pll_level__")
     typevars = {param: _PllAnyContract(param.__name__) for param in getattr(cls, "__type_params__", ())}
-    made = {}
+    made, table = {}, {}
 
     def contracts():
         if not made:
             for field in _pll_dataclasses.fields(cls):
-                made[field.name] = _pll_compile(field.type, None, namespace, level, typevars)
+                made[field.name] = _pll_compile(field.type, None, namespace, level, typevars, table=table)
         return made
 
     _PLL_DATACLASS_FIELDS[cls] = contracts
