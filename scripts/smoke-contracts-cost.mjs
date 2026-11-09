@@ -29,18 +29,40 @@ def _pll_wrapped(function, source, blame):
     global _pll_test_wraps
     _pll_test_wraps += 1
     return _pll_test_wrapped(function, source, blame)
+
+_pll_test_seals = 0
+_pll_test_wrap = _PllSeal.wrap
+
+def _pll_test_sealing(self, value):
+    global _pll_test_seals
+    _pll_test_seals += 1
+    return _pll_test_wrap(self, value)
+
+_PllSeal.wrap = _pll_test_sealing
+
+_pll_test_calls = 0
+_pll_test_call = _PllCall.__init__
+
+def _pll_test_calling(self, *args):
+    global _pll_test_calls
+    _pll_test_calls += 1
+    _pll_test_call(self, *args)
+
+_PllCall.__init__ = _pll_test_calling
 `);
 
 let runs = 0;
-/** Run `source` at `level`: its output, its error, the leaf checks it made and the wrappers it asked for. */
+/** Run `source` at `level`: its output, its error, the leaf checks it made, the wrappers it asked for, the values it sealed and the calls through wrappers. */
 function ran(source, level = "beginner", session = `cost-${(runs += 1)}`) {
-  pyodide.runPython("_pll_test_checks = 0\n_pll_test_wraps = 0");
+  pyodide.runPython("_pll_test_checks = 0\n_pll_test_wraps = 0\n_pll_test_seals = 0\n_pll_test_calls = 0");
   const result = JSON.parse(pllCall("_pll_run_file", JSON.stringify([source, "lab.py", session, level, false])));
   return {
     stdout: result.stdout,
     error: result.error ?? null,
     checks: pyodide.runPython("_pll_test_checks"),
     wraps: pyodide.runPython("_pll_test_wraps"),
+    seals: pyodide.runPython("_pll_test_seals"),
+    calls: pyodide.runPython("_pll_test_calls"),
   };
 }
 
@@ -358,6 +380,197 @@ if (section(10, "a union inside a union takes a value as one of its members woul
   const given = ran(lines("type Maybe[X] = X | None", "", "def keep[T](x: Maybe[T] | int) -> int:", "    return 0", "", 'print(keep("s"))'));
   expect(given.stdout === "0\n" && given.error === null, `given through an alias of a union: ${given.stdout} ${given.error?.message}`);
   console.log("    a generic function's T through an alias of a union, both ways");
+}
+
+if (section(11, "a generic function calling itself keeps the seals it is in")) {
+  const LENGTH_T = ["def length[T](l: Node[T] | None) -> int:", "    return 0 if l is None else 1 + length(l.rest)", ""];
+  const [a, b] = [100, 200].map((n) => ran(lines(...LOOPED(n, 0), ...LENGTH_T, `print(length(build(${n})))`), "intermediate"));
+  expect(a.stdout === "100\n" && b.stdout === "200\n", `length: ${a.stdout} ${b.stdout} ${b.error?.message}`);
+  expect(b.seals <= 2 * a.seals + 8, `seals made: ${a.seals} at 100, ${b.seals} at 200`);
+  // Still parametric: what it gives back as a T, it was given as one.
+  const last = ran(
+    lines(...LOOPED(50, 7), "def last[T](l: Node[T]) -> T:", "    return l.first if l.rest is None else last(l.rest)", "", "print(last(build(50)))"),
+    "intermediate",
+  );
+  expect(last.stdout === "7\n" && last.error === null, `last: ${last.stdout} ${last.error?.message}`);
+  // A value can reach it past its type variables (`object`): not kept.
+  const past = ran(lines("def f[T](x: T, y: object, k: int) -> T:", "    return y if k == 0 else f(x, x, k - 1)", "", "print(f(1, 2, 3))"), "intermediate");
+  expect(past.error?.errorType === "TypeMismatch", `given past T: ${past.stdout} ${past.error?.errorType}`);
+  // A U given back as a T is still refused.
+  const swapped = ran(lines("def g[T, U](x: T, y: U, k: int) -> T:", "    return x if k == 0 else g(y, x, k - 1)", "", 'print(g(1, "a", 1))'), "intermediate");
+  expect(swapped.error?.errorType === "TypeMismatch", `T and U swapped: ${swapped.stdout} ${swapped.error?.errorType}`);
+  // None given to itself as a list is refused.
+  const none = ran(lines("def f[T](l: list[T], k: int) -> int:", "    return 0 if k == 0 else f(None, k - 1)", "", "print(f([1], 1))"), "intermediate");
+  expect(none.error?.errorType === "TypeMismatch", `None as a list[T]: ${none.stdout} ${none.error?.errorType}`);
+  // What a call it made sealed, and kept past its end, is not its own.
+  const stashed = ran(
+    lines(
+      "stash = None",
+      "",
+      "def f[T](x: T, k: int) -> T:",
+      "    global stash",
+      "    if k == 0:",
+      "        stash = x",
+      "        return x",
+      "    ignored = f(0, k - 1)",
+      "    return stash",
+      "",
+      "print(f(1, 1))",
+    ),
+    "intermediate",
+  );
+  expect(stashed.error?.errorType === "TypeMismatch", `an inner call's seal given back: ${stashed.stdout} ${stashed.error?.errorType} ${stashed.error?.message}`);
+  console.log("    one seal per value along the recursion; still only what it was given");
+}
+
+if (section(12, "a generic function's copy of a dataclass fills in a field only when it is read")) {
+  const IS_EMPTY = ["def is_empty[T](l: Node[T] | None) -> bool:", "    return l is None", ""];
+  const COUNT = ["def length(l: Node[int] | None) -> int:", "    return 0 if is_empty(l) else 1 + length(l.rest)", ""];
+  const [a, b] = [100, 200].map((n) => ran(lines(...LOOPED(n, 0), ...IS_EMPTY, ...COUNT, `print(length(build(${n})))`), "intermediate"));
+  expect(a.stdout === "100\n" && b.stdout === "200\n", `length: ${a.stdout} ${b.stdout} ${b.error?.message}`);
+  expect(b.seals <= 2 * a.seals + 8, `seals made: ${a.seals} at 100, ${b.seals} at 200`);
+  const second = ran(lines(...LOOPED(5, 7), "def second[T](l: Node[T]) -> T:", "    return l.rest.first", "", "print(second(build(5)))"), "intermediate");
+  expect(second.stdout === "2\n" && second.error === null, `second: ${second.stdout} ${second.error?.message}`);
+  const BOX = ["@dataclass", "class Box[T]:", "    item: T", ""];
+  // What it copies changes after the call: the copy holds what it held.
+  const later = ran(
+    lines(...BOX, "def later[T](b: Box[T]) -> Callable[[], T]:", "    return lambda: b.item", "", "b = Box(5)", "get = later(b)", "del b.item", "print(get())"),
+    "intermediate",
+  );
+  expect(later.stdout === "5\n" && later.error === null, `read after a change: ${later.stdout} ${later.error?.message}`);
+  const copied = ran(lines("import copy", "", ...BOX, "def dup[T](b: Box[T]) -> Box[T]:", "    return copy.copy(b)", "", "print(dup(Box(5)).item)"), "intermediate");
+  expect(copied.stdout === "5\n" && copied.error === null, `a copy of the copy: ${copied.stdout} ${copied.error?.message}`);
+  // A field with a default, which the class holds too.
+  const OPT = ["@dataclass", "class Opt[T]:", "    item: T", "    count: int = 0", ""];
+  const counted = ran(lines(...OPT, "def count[T](o: Opt[T]) -> int:", "    return o.count", "", "print(count(Opt(1, 5)))"), "intermediate");
+  expect(counted.stdout === "5\n" && counted.error === null, `a field with a default: ${counted.stdout} ${counted.error?.message}`);
+  const SIZE = ["    n = 0", "    m = l", "    while m is not None:", "        n = n + 1", "        m = m.rest", "    return n", ""];
+  // A field that names the class again and has a default is filled at once: by a walk, however long the list.
+  const DNODE = ["@dataclass", "class DNode[T]:", "    first: T", '    rest: "DNode[T] | None" = None', ""];
+  const defaulted = ran(
+    lines(...DNODE, "def size[T](l: DNode[T] | None) -> int:", ...SIZE, "l = None", "for i in range(1000):", "    l = DNode(i, l)", "print(size(l))"),
+    "intermediate",
+  );
+  expect(defaulted.stdout === "1000\n" && defaulted.error === null, `a default that names the class: ${defaulted.stdout} ${defaulted.error?.errorType}`);
+  // What the function's own contract says decides, not what the value's class says.
+  const LOOSER = ["@dataclass", "class Tag[T]:", "    item: T", "    count: int", "", "@dataclass", "class Looser[T](Tag[T]):", "    count: object", ""];
+  const looser = ran(lines(...LOOSER, "def g[T](t: Tag[T]) -> int:", "    return 0", "", 'print(g(Looser(1, "x")))'), "intermediate");
+  expect(looser.error?.errorType === "TypeMismatch", `a subclass's looser field: ${looser.stdout} ${looser.error?.errorType}`);
+  // A part whose changes PLL can't see: each call copies the value whole, once. Building such a
+  // list checks the rest of it at each cell, so one call's checks are two calls' less one's.
+  const ODD = ["@dataclass", "class Odd[T]:", "    v: T", "", "    def __setattr__(self, name, value):", "        object.__setattr__(self, name, value)", ""];
+  const TAGGED = ["@dataclass", "class Tagged[T]:", "    first: T", "    tag: Odd[int]", '    rest: "Tagged[T] | None"', ""];
+  const sized = (n, calls) =>
+    ran(
+      lines(...ODD, ...TAGGED, "def size[T](l: Tagged[T] | None) -> int:", ...SIZE, "l = None", `for i in range(${n}):`, "    l = Tagged(i, Odd(i), l)", ...Array(calls).fill("print(size(l))")),
+      "intermediate",
+    ).checks;
+  const [once100, once200] = [100, 200].map((n) => sized(n, 2) - sized(n, 1));
+  expect(once200 <= 2 * once100 + 8, `a part PLL can't watch: ${once100} checks for one call at 100, ${once200} at 200`);
+  console.log("    no seal for a field never read; what is read is what a whole copy holds");
+}
+
+if (section(13, "a generic function calling itself passes its results back, and its function arguments down, as they are")) {
+  const DOUBLE = ["def double(x):", "    return 2 * x", ""];
+  const MAPPED = ["def mapped[T, U](f: Callable[[T], U], l: Node[T] | None) -> Node[U] | None:", "    return None if l is None else Node(f(l.first), mapped(f, l.rest))", ""];
+  const [a, b] = [100, 200].map((n) => ran(lines(...LOOPED(n, 0), ...DOUBLE, ...MAPPED, `print(mapped(double, build(${n})).first)`), "intermediate"));
+  expect(a.stdout === "196\n" && b.stdout === "396\n", `mapped: ${a.stdout} ${b.stdout} ${b.error?.message}`);
+  // A call of f at depth d went through d wrappers.
+  expect(b.calls <= 2 * a.calls + 8, `calls through wrappers: ${a.calls} at 100, ${b.calls} at 200`);
+  expect(b.checks <= 2 * a.checks + 8 && b.seals <= 2 * a.seals + 8, `checks ${a.checks}, ${b.checks}; seals ${a.seals}, ${b.seals}`);
+  // Still parametric at any depth, and blamed as before.
+  const AT = (k, base, step) => [
+    "def mapped[T, U](f: Callable[[T], U], l: Node[T] | None, k: int) -> Node[U] | None:",
+    "    if l is None:",
+    "        return None",
+    "    if k == 0:",
+    `        return ${base}`,
+    `    return Node(f(l.first), mapped(f, ${step}, k - 1))`,
+    "",
+    `print(mapped(double, build(8), ${k}))`,
+  ];
+  const back = ran(lines(...LOOPED(8, 0), ...DOUBLE, ...AT(5, "Node(l.first, None)", "l.rest")), "intermediate");
+  expect(back.error?.message === "the first of a Node of the return value of mapped is T (Node), not U", `a T given back as U at depth 5: ${back.error?.message}`);
+  const given = ran(lines(...LOOPED(8, 0), ...DOUBLE, ...AT(3, "Node(f(l.first), None)", "Node(0, l.rest) if k == 1 else l.rest")), "intermediate");
+  expect(given.error?.message === "argument f of mapped is 0 (int), not T", `a non-T given to f at depth 3: ${given.error?.message}`);
+  // A function given down the chain, kept past the call that took it.
+  const INC = ["def inc(x):", "    return x + 1", ""];
+  const kept = ran(
+    lines(...INC, "def repeat[T](f: Callable[[T], T], n: int) -> Callable[[T], T]:", "    if n == 0:", "        return lambda x: x", "    g = repeat(f, n - 1)", "    return lambda x: f(g(x))", "", "print(repeat(inc, 3)(0))"),
+    "intermediate",
+  );
+  expect(kept.stdout === "3\n" && kept.error === null, `f kept past its call: ${kept.stdout} ${kept.error?.message}`);
+  // A function f gives back whose argument is a union with T in it: its layers are all kept.
+  const UNION = ["def mk(x):", "    return lambda y: x", "", "def walk[T](f: Callable[[T], Callable[[T | int], T]], x: T, y: T, k: int) -> T:", "    if k == 0:", "        return f(x)(y)", "    return walk(f, x, 5 if k == 2 else y, k - 1)", ""];
+  const union = ran(lines(...UNION, "print(walk(mk, 1, 0, 3))"), "intermediate");
+  expect(union.stdout === "1\n" && union.error === null, `a union in what f gives back: ${union.stdout} ${union.error?.message}`);
+  // A function f gives back has T in it: its layers are all kept, and it works past the calls.
+  const MK = ["def mk(v):", "    return lambda y: y", ""];
+  const returned = ran(
+    lines(...MK, "def app[T](f: Callable[[T], Callable[[T], T]], x: T, k: int) -> Callable[[T], T]:", "    if k == 0:", "        return f(x)", "    return app(f, x, k - 1)", "", "print(app(mk, 1, 2)(7))"),
+    "intermediate",
+  );
+  expect(returned.stdout === "7\n" && returned.error === null, `a function f gives back: ${returned.stdout} ${returned.error?.message}`);
+  // A result a call changed in place, where PLL can't see it, is checked again.
+  const DEQUE = ["from collections import deque", ""];
+  const changed = ran(
+    lines(...DEQUE, "def f[T](n: int) -> deque[T]:", "    if n == 0:", "        return deque()", "    d = f(n - 1)", "    d.append(5)", "    return d", "", "print(f(1))"),
+    "intermediate",
+  );
+  expect(changed.error?.message === "item 0 of the return value of f is 5 (deque), not T", `a result changed in place: ${changed.stdout} ${changed.error?.message}`);
+  // So is an argument: the call that changed it is blamed, at its own return, as LSL blames it.
+  const argument = ran(
+    lines(...DEQUE, "def f[T](d: deque[T], n: int) -> T:", "    if n == 0:", "        return d[-1]", "    d.append(5)", "    return f(d, n - 1)", "", "print(f(deque([1]), 1))"),
+    "intermediate",
+  );
+  expect(
+    argument.error?.message === "the return value of f is 5 (int), not T" && argument.error?.facts?.check?.returned_at === 7,
+    `an argument changed in place: ${argument.error?.message} at line ${argument.error?.facts?.check?.returned_at}`,
+  );
+  // A result's part that is shared, not copied, changed in place: checked again.
+  const shared = ran(
+    lines(...DEQUE, "def push(d, v):", "    d.append(v)", "", "def f[T](n: int) -> tuple[list[T], deque[int]]:", "    if n == 0:", "        return ([], deque([1]))", "    r = f(n - 1)", '    push(r[1], "x")', "    return r", "", "print(f(1))"),
+    "intermediate",
+  );
+  expect(shared.error?.message === 'item 1 of item 1 of the return value of f is "x" (tuple), not int', `a shared part changed in place: ${shared.stdout} ${shared.error?.message}`);
+  // f given two arguments: a layer checks both before the next, so the one refused is the one the layers it stands for refuse.
+  const order = ran(
+    lines("def first(a, b):", "    return a", "", "def app[T](g: Callable[[T, T], T], x: T, k: int) -> T:", "    if k == 0:", "        return g(x, 7)", "    return app(g, 5 if k == 1 else x, k - 1)", "", "print(app(first, 1, 2))"),
+    "intermediate",
+  );
+  expect(order.error?.message === "argument g of app is 7 (int), not T", `two arguments, each refused at its own layer: ${order.error?.message}`);
+  // An argument of f with no type variable in it, refused where the layers it stands for refuse it, as precisely.
+  const precise = ran(
+    lines("def first(a, b):", "    return a", "", "def app[T](g: Callable[[T, int | None], T], x: T, k: int) -> T:", "    if k == 0:", "        return g(x, True)", "    return app(g, x, k - 1)", "", "print(app(first, 1, 2))"),
+    "intermediate",
+  );
+  expect(precise.error?.message === "argument g of app is True (bool), not int", `a union argument refused at depth 2: ${precise.error?.message}`);
+  // A deque is copied again for each call to itself, as LSL copies it: what one call adds, the other doesn't see.
+  const own = ran(
+    lines(...DEQUE, "def f[T](d: deque[T], k: int) -> int:", "    if k == 0:", "        d.append(d[0])", "        return 0", "    n = f(d, k - 1)", "    return len(d) + n", "", "print(f(deque([1]), 1))"),
+    "intermediate",
+  );
+  expect(own.stdout === "1\n" && own.error === null, `each call's own copy of a deque: ${own.stdout} ${own.error?.message}`);
+  // A value an inner call sealed, reaching an outer call's wrapper past its annotations: as before.
+  const inner = ran(
+    lines("stash = None", "", "def get(v):", "    return stash", "", "def app[T](g: Callable[[T], T], a: T, b: T, k: int) -> T:", "    global stash", "    if k == 0:", "        stash = b", "        return g(a)", "    return app(g, a, 5, k - 1)", "", "r = app(get, 1, 2, 1)"),
+    "intermediate",
+  );
+  expect(inner.error?.message === "the return value of app is T (T), not T", `an inner call's value through a global: ${inner.error?.message}`);
+  // Where it is not LSL's: a call can give back as T what a call it is
+  // inside holds as T, reached past its annotations - here, a global, for a
+  // value and for a function.
+  const stashedG = ran(
+    lines("stash = None", "", "def ident(v):", "    return v", "", "def app[T](g: Callable[[T], T], x: T, k: int) -> T:", "    global stash", "    if k == 0:", "        return stash(x)", "    stash = g", "    ignored = app(g, 5, k - 1)", "    return x", "", "print(app(ident, 1, 1))"),
+    "intermediate",
+  );
+  expect(stashedG.stdout === "1\n" && stashedG.error === null, `an outer call's g, given an inner call's T: ${stashedG.stdout} ${stashedG.error?.message}`);
+  const stashed = ran(
+    lines("stash = None", "", "def f[T](x: T, k: int) -> T:", "    global stash", "    if k == 1:", "        stash = x", "        return f(x, 0)", "    return stash", "", "print(f(1, 1))"),
+    "intermediate",
+  );
+  expect(stashed.stdout === "1\n" && stashed.error === null, `an outer call's T, through a global: ${stashed.stdout} ${stashed.error?.message}`);
+  console.log("    one wrapper on f however deep; linear checks; the same blame at depth; the one way it differs from LSL");
 }
 
 console.log(passed() ? "\nsmoke-contracts-cost: ok" : "\nsmoke-contracts-cost: FAILED");

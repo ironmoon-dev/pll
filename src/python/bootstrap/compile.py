@@ -1080,6 +1080,10 @@ def _pll_check_dataclass_fields(cls):
         cls.__setattr__ = _pll_checked_setattr
     if cls.__delattr__ is object.__delattr__:
         cls.__delattr__ = _pll_checked_delattr
+    if getattr(cls, "__getattr__", None) is None and _pll_can_be_lazy(cls):
+        cls.__getattr__ = _pll_lazy_field
+        if cls.__getstate__ is object.__getstate__:
+            cls.__getstate__ = _pll_whole_state
     return cls
 
 

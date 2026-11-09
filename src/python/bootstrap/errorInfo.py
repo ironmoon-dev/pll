@@ -419,6 +419,7 @@ def _pll_error_info(exc, run=None, level=None):
       its annotation, a swapped field, the name a value that is not a
       function was called by - and from the code (`_pll_code_facts`).
     """
+    _pll_fill_lazy(quietly=True)
     _pll_enrich_index_error(exc, run)
     _pll_enrich_not_callable(exc, run)
     _pll_enrich_module_not_found(exc)
