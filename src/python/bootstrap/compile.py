@@ -1226,7 +1226,11 @@ def _pll_with_contracts(tree, code, filename, level):
     instrument still runs, unchecked.
     """
     if not _pll_checks_annotations(level):
+        _pll_note_channels(filename, [(1, "a file PLL doesn't check")])
         return tree
+    channels = _PllChannels()
+    channels.visit(tree)
+    _pll_note_channels(filename, channels.found)
     with _pll_recording_compile_warnings():
         try:
             instrumented = _pll_copy.deepcopy(tree)
@@ -1254,6 +1258,91 @@ def _pll_with_contracts(tree, code, filename, level):
             ))
             return tree
 
+
+
+#: Libraries known to keep nothing they are given, which a program may
+#: import and still have its generic functions' calls to themselves keep
+#: their seals (`_PllChannels`).
+_PLL_KEEP_NOTHING = frozenset((
+    "__future__", "math", "cmath", "random", "dataclasses", "typing", "collections", "functools", "itertools",
+    "operator", "string", "re", "statistics", "fractions", "decimal", "enum", "abc", "copy", "time", "datetime",
+    "json",
+))
+
+#: Methods and functions that keep what they are given in what they are
+#: called on or given.
+_PLL_STORING = frozenset((
+    "append", "extend", "insert", "appendleft", "extendleft", "add", "update", "setdefault", "put", "put_nowait",
+    "send", "heappush", "heappushpop", "heapreplace", "insort", "insort_left", "insort_right",
+    "__setitem__", "__setattr__", "__set__", "__iadd__", "__ior__",
+))
+
+#: Built-in functions that reach a namespace, or set an attribute, by name.
+_PLL_REFLECTING = frozenset((
+    "setattr", "delattr", "vars", "globals", "locals", "eval", "exec", "compile", "__import__",
+))
+
+
+class _PllChannels(_ast.NodeVisitor):
+    """The ways a file can carry a value from one call to another past their
+    annotations, each as its line and what it is (`found`): a name bound
+    with `global` or `nonlocal`; an attribute or item set or deleted, but an
+    attribute of `self` set in its `__init__` or `__post_init__`; a call that
+    keeps what it is given (`_PLL_STORING`) or reaches a namespace
+    (`_PLL_REFLECTING`); and an import of a library not known to keep
+    nothing (`_PLL_KEEP_NOTHING`), as a student's own file is read on its
+    own."""
+
+    def __init__(self):
+        self.found, self.constructing = [], False
+
+    def note(self, node, what):
+        self.found.append((getattr(node, "lineno", 1), what))
+
+    def visit_Global(self, node):
+        self.note(node, "global")
+
+    def visit_Nonlocal(self, node):
+        self.note(node, "nonlocal")
+
+    def visit_FunctionDef(self, node):
+        outer, self.constructing = self.constructing, node.name in ("__init__", "__post_init__")
+        self.generic_visit(node)
+        self.constructing = outer
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_Attribute(self, node):
+        if isinstance(node.ctx, _ast.Del) or isinstance(node.ctx, _ast.Store) and not (
+            self.constructing and isinstance(node.value, _ast.Name) and node.value.id == "self"
+        ):
+            self.note(node, "an attribute set")
+        self.generic_visit(node)
+
+    def visit_Subscript(self, node):
+        if isinstance(node.ctx, (_ast.Store, _ast.Del)):
+            self.note(node, "an item set")
+        self.generic_visit(node)
+
+    def visit_Call(self, node):
+        func = node.func
+        if isinstance(func, _ast.Attribute) and func.attr in _PLL_STORING:
+            self.note(node, func.attr)
+        elif isinstance(func, _ast.Name) and (func.id in _PLL_STORING or func.id in _PLL_REFLECTING):
+            self.note(node, func.id)
+        self.generic_visit(node)
+
+    def visit_Import(self, node):
+        for alias in node.names:
+            self.imported(node, alias.name)
+
+    def visit_ImportFrom(self, node):
+        if node.level == 0 and node.module:
+            self.imported(node, node.module)
+
+    def imported(self, node, module):
+        if not _pll_may_be_students(module, 0) and module.split(".")[0] not in _PLL_KEEP_NOTHING:
+            self.note(node, "import " + module)
 
 class _PllTopLevelExprWrapper(_ast.NodeTransformer):
     """Wrap module-level expression statements so they auto-display.

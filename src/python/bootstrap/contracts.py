@@ -709,11 +709,25 @@ _PLL_HELD = 4
 _PLL_HOLDING = _pll_weakref.WeakSet()
 
 
-def _pll_let_go():
-    """At the start of a run: no memory holds an earlier run's values."""
+def _pll_run_starts():
+    """At the start of a run: no memory holds an earlier run's values, and no
+    earlier run's files count among the program's channels."""
     for accepted in list(_PLL_HOLDING):
         accepted.held.clear()
     _PLL_HOLDING.clear()
+    _PLL_CHANNELS.clear()
+
+
+#: The files of this run, and of the prompt lines since, with a way to
+#: carry a value from one call to another past their annotations (compile.py's
+#: `_PllChannels`): by file, each way's line and what it is. While there is
+#: one, a generic function's calls to itself seal afresh (`_pll_call_seals`).
+_PLL_CHANNELS = {}
+
+
+def _pll_note_channels(filename, found):
+    if found:
+        _PLL_CHANNELS.setdefault(filename, found)
 
 
 class _PllGoing:
@@ -1737,12 +1751,13 @@ class _PllCall:
 def _pll_call_seals(contract, blame):
     """The seals of a call of a generic function: its type variables sealed
     afresh - but a call it makes to itself, where nothing but its type
-    variables can bring it a sealed value (`reuses`), keeps the seals of the
+    variables can bring it a sealed value (`reuses`) and no file of the
+    program can carry one past them (`_PLL_CHANNELS`), keeps the seals of the
     call it is inside (`_PllSeal.kept`)."""
-    first = contract.variables[0]
-    inside = _PLL_CALLS[-1].seals if _PLL_CALLS and contract.reuses and blame.positive is blame.negative else None
+    first, chained = contract.variables[0], contract.reuses and not _PLL_CHANNELS
+    inside = _PLL_CALLS[-1].seals if _PLL_CALLS and chained and blame.positive is blame.negative else None
     if inside is None or getattr(inside.get(first.typevar), "variable", None) is not first:
-        link = _PllLink(None, {} if contract.reuses else None)
+        link = _PllLink(None, {} if chained else None)
         return {v.typevar: _PllSeal(v, link) for v in contract.variables}
     link = _PllLink(inside[first.typevar].link)
     return {v.typevar: _PllSeal(v, link, inside[v.typevar]) for v in contract.variables}

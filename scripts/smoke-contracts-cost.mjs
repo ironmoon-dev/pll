@@ -551,26 +551,59 @@ if (section(13, "a generic function calling itself passes its results back, and 
     "intermediate",
   );
   expect(own.stdout === "1\n" && own.error === null, `each call's own copy of a deque: ${own.stdout} ${own.error?.message}`);
-  // A value an inner call sealed, reaching an outer call's wrapper past its annotations: as before.
+  // A value an inner call sealed, reaching an outer call's wrapper through a global: a channel (section 14),
+  // so sealed afresh at each call, and passed out still sealed, as fresh seals per call pass it.
   const inner = ran(
     lines("stash = None", "", "def get(v):", "    return stash", "", "def app[T](g: Callable[[T], T], a: T, b: T, k: int) -> T:", "    global stash", "    if k == 0:", "        stash = b", "        return g(a)", "    return app(g, a, 5, k - 1)", "", "r = app(get, 1, 2, 1)"),
     "intermediate",
   );
-  expect(inner.error?.message === "the return value of app is T (T), not T", `an inner call's value through a global: ${inner.error?.message}`);
-  // Where it is not LSL's: a call can give back as T what a call it is
-  // inside holds as T, reached past its annotations - here, a global, for a
-  // value and for a function.
+  expect(inner.error === null, `an inner call's value through a global: ${inner.error?.message}`);
+  // What the chain would let through - a call giving back as T what a call
+  // it is inside holds as T, reached through a global - is refused: a global
+  // is a channel (section 14), so each call seals afresh.
   const stashedG = ran(
     lines("stash = None", "", "def ident(v):", "    return v", "", "def app[T](g: Callable[[T], T], x: T, k: int) -> T:", "    global stash", "    if k == 0:", "        return stash(x)", "    stash = g", "    ignored = app(g, 5, k - 1)", "    return x", "", "print(app(ident, 1, 1))"),
     "intermediate",
   );
-  expect(stashedG.stdout === "1\n" && stashedG.error === null, `an outer call's g, given an inner call's T: ${stashedG.stdout} ${stashedG.error?.message}`);
+  expect(stashedG.error?.message === "argument g of app is T (T), not T", `an outer call's g, given an inner call's T: ${stashedG.stdout} ${stashedG.error?.message}`);
   const stashed = ran(
     lines("stash = None", "", "def f[T](x: T, k: int) -> T:", "    global stash", "    if k == 1:", "        stash = x", "        return f(x, 0)", "    return stash", "", "print(f(1, 1))"),
     "intermediate",
   );
-  expect(stashed.stdout === "1\n" && stashed.error === null, `an outer call's T, through a global: ${stashed.stdout} ${stashed.error?.message}`);
+  expect(stashed.error?.message === "the return value of f is T (T), not T", `an outer call's T, through a global: ${stashed.stdout} ${stashed.error?.message}`);
   console.log("    one wrapper on f however deep; linear checks; the same blame at depth; the one way it differs from LSL");
+}
+
+if (section(14, "where any file has a way to carry a value past annotations, a generic function's calls to itself seal afresh")) {
+  const SMUGGLE = (take, keep) => ["def f[T](a: T, b: T, k: int) -> T:", "    if k == 0:", `        return ${take}`, `    ${keep}`, "    return f(a, a, k - 1)", ""];
+  const REFUSED = "the return value of f is T (T), not T";
+  const CHANNELS = {
+    "a global": ["stash = None", "", "def f[T](a: T, b: T, k: int) -> T:", "    global stash", "    if k == 0:", "        return stash", "    stash = b", "    return f(a, a, k - 1)", ""],
+    "a function's attribute": ["def holder():", "    return None", "", ...SMUGGLE("holder.stash", "holder.stash = b")],
+    "an object a helper sets": ["class Holder:", "    pass", "", "holder = Holder()", "", "def put(v):", "    holder.v = v", "", "def get():", "    return holder.v", "", ...SMUGGLE("get()", "put(b)")],
+    "a deque": ["from collections import deque", "", "q = deque()", "", ...SMUGGLE("q.pop()", "q.append(b)")],
+    "a generator": ["def keeper():", "    held = None", "    while True:", "        sent = yield held", "        if sent is not None:", "            held = sent", "", "kept = keeper()", "next(kept)", "", ...SMUGGLE("kept.send(None)", "kept.send(b)")],
+  };
+  for (const [what, program] of Object.entries(CHANNELS)) {
+    const run = ran(lines(...program, "print(f(1, 2, 1))"), "intermediate");
+    expect(run.error?.message === REFUSED, `${what}: ${run.stdout} ${run.error?.message}`);
+  }
+  const nested = ran(
+    lines("def outer():", "    stash = None", "", "    def f[T](a: T, b: T, k: int) -> T:", "        nonlocal stash", "        if k == 0:", "            return stash", "        stash = b", "        return f(a, a, k - 1)", "", "    return f(1, 2, 1)", "", "print(outer())"),
+    "intermediate",
+  );
+  expect(nested.error?.message === "the return value of outer.f is T (T), not T", `nonlocal: ${nested.stdout} ${nested.error?.message}`);
+  const extra = ran(
+    lines("@dataclass", "class Box[T]:", "    v: T", "", "def f[T](x: T, b: Box[int], k: int) -> T:", "    if k == 0:", "        return b.extra", "    c = Box(0)", "    c.extra = x", "    return f(x, c, k - 1)", "", "print(f(1, Box(0), 1))"),
+    "intermediate",
+  );
+  expect(extra.error?.message === REFUSED, `an attribute of an argument that isn't T: ${extra.stdout} ${extra.error?.message}`);
+  // With none, the chain stays: a call of f goes through one wrapper however deep.
+  const DOUBLE = ["def double(x):", "    return 2 * x", ""];
+  const MAPPED = ["def mapped[T, U](f: Callable[[T], U], l: Node[T] | None) -> Node[U] | None:", "    return None if l is None else Node(f(l.first), mapped(f, l.rest))", ""];
+  const [a, b] = [100, 200].map((n) => ran(lines(...LOOPED(n, 0), ...DOUBLE, ...MAPPED, `print(mapped(double, build(${n})).first)`), "intermediate"));
+  expect(a.stdout === "196\n" && b.calls <= 2 * a.calls + 8, `no channel: ${a.calls} calls at 100, ${b.calls} at 200`);
+  console.log("    a global, a function's attribute, a helper, a deque, a generator, nonlocal, an argument's attribute: sealed afresh; none: one chain");
 }
 
 console.log(passed() ? "\nsmoke-contracts-cost: ok" : "\nsmoke-contracts-cost: FAILED");
