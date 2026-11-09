@@ -401,6 +401,9 @@ class _PllUnionContract(_PllContract):
     def shaped(self, value):
         return any(member.shaped(value) for member in self.members)
 
+    def fits(self, value, blame):
+        return any(member.accepts(value) if member.is_flat() else member.fits(value, blame) for member in self.members)
+
     def expected(self):
         return [text for member in self.members for text in member.expected()]
 

@@ -352,5 +352,13 @@ if (section(9, "a variable's annotation with a name in quotes is read in each ru
   console.log("    each run's own Dog, through an alias too; each annotation in its own words");
 }
 
+if (section(10, "a union inside a union takes a value as one of its members would")) {
+  const result = ran(lines("type Opt[X] = list[X] | None", "", "def wrap[T](x: T) -> Opt[T] | int:", "    return [x]", "", "print(wrap(1))"));
+  expect(result.stdout === "[1]\n" && result.error === null, `given back through an alias of a union: ${result.stdout} ${result.error?.message}`);
+  const given = ran(lines("type Maybe[X] = X | None", "", "def keep[T](x: Maybe[T] | int) -> int:", "    return 0", "", 'print(keep("s"))'));
+  expect(given.stdout === "0\n" && given.error === null, `given through an alias of a union: ${given.stdout} ${given.error?.message}`);
+  console.log("    a generic function's T through an alias of a union, both ways");
+}
+
 console.log(passed() ? "\nsmoke-contracts-cost: ok" : "\nsmoke-contracts-cost: FAILED");
 if (!passed()) process.exitCode = 1;
