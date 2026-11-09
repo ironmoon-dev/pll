@@ -2144,22 +2144,41 @@ def _pll_type_text(annotation, typevars=None):
 
 
 #: Contracts made from an annotation that is itself the type (`int`,
-#: `list[int]`), by `(annotation, level)`: an assignment makes its contract
-#: each time it runs.
+#: `list[int]`), by `(annotation, written, level)`: an assignment makes its
+#: contract each time it runs.
 _PLL_MADE = {}
 
 
 def _pll_contract_of(annotation, written, namespace, level):
     try:
-        key = (annotation, level)
+        key = (annotation, written, level)
         made = _PLL_MADE.get(key)
     except TypeError:
         key = made = None
     if made is None:
         made = _pll_compile(annotation, written, namespace, level)
-        if key is not None and not isinstance(annotation, str):
+        if key is not None and not _pll_quotes(annotation):
             _PLL_MADE[key] = made
     return made
+
+
+def _pll_quotes(annotation, seen=frozenset()):
+    """Whether `annotation` has a name in quotes in it, which its run reads -
+    a type alias's value included."""
+    if isinstance(annotation, (str, _pll_typing.ForwardRef)):
+        return True
+    origin = _pll_typing.get_origin(annotation)
+    if origin is _pll_typing.Literal:
+        return False
+    parts = list(annotation if isinstance(annotation, (list, tuple)) else _pll_typing.get_args(annotation))
+    for alias in (annotation, origin):
+        if isinstance(alias, _pll_typing.TypeAliasType) and id(alias) not in seen:
+            seen = seen | {id(alias)}
+            try:
+                parts.append(alias.__value__)
+            except Exception:
+                return True
+    return any(_pll_quotes(part, seen) for part in parts)
 
 
 def _pll_contract_assigned(value, annotation, written, name, party, line, quoted):

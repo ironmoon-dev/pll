@@ -334,5 +334,23 @@ if (section(8, "a function passed between functions with the same parameter type
   console.log("    the same checks, kept once; the same blame");
 }
 
+if (section(9, "a variable's annotation with a name in quotes is read in each run")) {
+  const DOGS = ["@dataclass", "class Dog:", "    name: str", "", 'pets: list["Dog"] = [Dog("a")]', "print(len(pets))"];
+  for (const [run, session] of [["first", "cost-dogs"], ["again", "cost-dogs"], ["in another file", "cost-dogs-2"]]) {
+    const dogs = ran(lines(...DOGS), "beginner", session);
+    expect(dogs.stdout === "1\n" && dogs.error === null, `run ${run}: ${dogs.stdout} ${dogs.error?.message}`);
+  }
+  // Through a type alias, after the class it names is made again.
+  const key = "cost-pack";
+  ran(lines("@dataclass", "class Dog:", "    name: str", "", 'type Pack = list["Dog"]', 'p: Pack = [Dog("a")]', "print(len(p))"), "advanced", key);
+  pllCall("_pll_repl_eval", JSON.stringify(["@dataclass\nclass Dog:\n    name: str\n", key, "advanced"]));
+  const packed = JSON.parse(pllCall("_pll_repl_eval", JSON.stringify(['q: Pack = [Dog("b")]\nprint(len(q))', key, "advanced"])));
+  expect(packed.stdout === "1\n" && !packed.error, `an alias's quoted name after Dog is made again: ${packed.stdout} ${packed.error?.message}`);
+  // Each annotation's own words in what it says.
+  const words = ran(lines("Numbers = list[int]", "xs: Numbers = [1]", "ys: list[int] = 5"), "advanced");
+  expect(words.error?.facts?.check?.expected?.[0] === "list[int]", `ys's annotation as written: ${JSON.stringify(words.error?.facts?.check?.expected)}`);
+  console.log("    each run's own Dog, through an alias too; each annotation in its own words");
+}
+
 console.log(passed() ? "\nsmoke-contracts-cost: ok" : "\nsmoke-contracts-cost: FAILED");
 if (!passed()) process.exitCode = 1;
