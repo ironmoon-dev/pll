@@ -258,5 +258,81 @@ if (section(5, "where nothing can change it, a list checked once is not walked a
   console.log("    each list checked once at intermediate; checked again where it can change");
 }
 
+if (section(6, "a function passed on through the same parameter is not wrapped again")) {
+  const APPLY = [
+    "def apply_n(f: Callable[[int], int], k: int, x: int) -> int:",
+    "    return x if k == 0 else apply_n(f, k - 1, f(x))",
+    "",
+    "def add1(x: int) -> int:",
+    "    return x + 1",
+    "",
+  ];
+  linear("apply_n", (n) => lines(...APPLY, `print(apply_n(add1, ${n}, 0))`), 100, 200);
+  // As deep as the same program goes unannotated: wrappers do not pile up
+  // on the stack either.
+  const deep = ran(lines(...APPLY, "print(apply_n(add1, 900, 0))"));
+  expect(deep.stdout === "900\n" && deep.error === null, `900 deep: ${deep.stdout} ${deep.error?.errorType} ${deep.error?.message}`);
+  // Still checked at each call, and still blamed on the caller.
+  const broken = ran(
+    lines(...APPLY, "def bad(x: int) -> int:", '    return "s" if x == 5 else x + 1', "", "print(apply_n(bad, 10, 0))"),
+  );
+  expect(
+    broken.error?.errorType === "TypeMismatch" && broken.error?.facts?.check?.blamed?.name === "bad",
+    `a result broken on the 6th call: ${broken.error?.errorType} ${JSON.stringify(broken.error?.facts?.check?.blamed)}`,
+  );
+  console.log("    one wrapper for the crossings that repeat; each call still checked");
+}
+
+if (section(7, "a method called from one line is put under its contract once")) {
+  const calls = (n) =>
+    ran(
+      lines(
+        "@dataclass",
+        "class Box:",
+        "    v: int",
+        "",
+        "    def get(self) -> int:",
+        "        return self.v",
+        "",
+        "def total(b: Box, k: int) -> int:",
+        "    s = 0",
+        "    for i in range(k):",
+        "        s = s + b.get()",
+        "    return s",
+        "",
+        `print(total(Box(1), ${n}))`,
+      ),
+      "intermediate",
+    );
+  const [few, many] = [calls(10), calls(1000)];
+  expect(many.stdout === "1000\n" && many.error === null, `1000 calls: ${many.stdout} ${many.error?.message}`);
+  expect(many.wraps === few.wraps, `wrappers: ${few.wraps} for 10 calls, ${many.wraps} for 1000`);
+  console.log("    one wrapper for the line, however many calls it makes");
+}
+
+if (section(8, "a function passed between functions with the same parameter types is not wrapped again either")) {
+  const PING = (other) => [
+    "def ping(f: Callable[[int], int], k: int, x: int) -> int:",
+    "    return x if k == 0 else pong(f, k - 1, f(x))",
+    "",
+    `def pong(f: Callable[[int], ${other}], k: int, x: int) -> int:`,
+    "    return x if k == 0 else ping(f, k - 1, f(x))",
+    "",
+    "def inc(x):",
+    "    return x + 1",
+    "",
+  ];
+  linear("ping and pong", (n) => lines(...PING("int"), `print(ping(inc, ${n}, 0))`), 100, 200);
+  const deep = ran(lines(...PING("int"), "print(ping(inc, 900, 0))"));
+  expect(deep.stdout === "900\n" && deep.error === null, `900 deep: ${deep.stdout} ${deep.error?.errorType} ${deep.error?.message}`);
+  // pong says f gives back a str: the first result it sees is ping's to answer for.
+  const broken = ran(lines(...PING("str"), "print(ping(inc, 6, 0))"));
+  expect(
+    broken.error?.errorType === "TypeMismatch" && broken.error?.facts?.check?.blamed?.name === "ping",
+    `pong's str broken: ${broken.error?.errorType} ${JSON.stringify(broken.error?.facts?.check?.blamed)}`,
+  );
+  console.log("    the same checks, kept once; the same blame");
+}
+
 console.log(passed() ? "\nsmoke-contracts-cost: ok" : "\nsmoke-contracts-cost: FAILED");
 if (!passed()) process.exitCode = 1;

@@ -128,6 +128,9 @@ class _PllBlame:
         merged.update(seals)
         return _PllBlame(self.positive, self.negative, self.owner, self.path, self.site, self.level, self.gives, merged)
 
+    def same(self, other):
+        return all(getattr(self, slot) == getattr(other, slot) for slot in self.__slots__)
+
 
 # -- what is raised ------------------------------------------------------------
 
@@ -1391,7 +1394,17 @@ def _pll_wrapped(function, source, blame):
     `source` is a function contract, or a definition, which makes its
     contract at the first call: a name in quotes in its annotations may be
     defined after the function is.
+
+    A function already under the same contract and obligation, outermost,
+    is given back as it is: the second layer could only repeat the first.
+    A `Callable[[...], R]` with no type variable joins the layers of that
+    kind already on the function (`_pll_collapsed`).
     """
+    if isinstance(source, _PllFunctionContract) and source.signature is None and not source.mentions_variables():
+        return _pll_collapsed(function, source, blame)
+    layer = getattr(function, "__pll_layer__", None)
+    if layer is not None and layer[0] is function and layer[1] is source and layer[2].same(blame):
+        return function
 
     def contracted(*args, **kwargs):
         contract = source.contract()
@@ -1429,8 +1442,128 @@ def _pll_wrapped(function, source, blame):
     # So `inspect.signature` sees the function's own parameters - even
     # asked not to look through a wrapper, as finding a test's are.
     contracted.__wrapped__ = function
+    contracted.__pll_layer__ = (contracted, source, blame)
     if isinstance(source, _PllDefinition):
         contracted.__signature__ = source.signature
+    return contracted
+
+
+class _PllLayerCheck:
+    """One check a layer of `_pll_collapsed` makes: its contract, the blame it
+    raises with, and the layer's own blame for a name it cannot read."""
+
+    __slots__ = ("contract", "blame", "layer", "flat", "key")
+
+    def __init__(self, contract, blame, layer):
+        self.contract, self.blame, self.layer = contract, blame, layer
+        try:
+            self.flat, self.key = contract.is_flat(), _pll_check_key(contract)
+        except _PllUnresolved:
+            # A name not defined yet: read at the call, as before, and never
+            # taken for another check.
+            self.flat, self.key = False, id(contract)
+
+    def apply(self, value):
+        try:
+            if not self.flat:
+                return self.contract.check(value, self.blame)
+            if not self.contract.accepts(value):
+                self.contract.check_now(value, self.blame)
+            return value
+        except _PllUnresolved as unresolved:
+            _pll_unresolved_inside(unresolved, self.layer)
+
+
+def _pll_check_key(contract, top=True):
+    """What makes two flat checks the same check, whatever their blame. A
+    part made later is only itself, so a type that names itself has a key."""
+    if isinstance(contract, _PllLaterContract):
+        if not top:
+            return id(contract)
+        contract = _pll_made(contract)
+    if isinstance(contract, _PllClassContract):
+        return ("class", contract.cls, contract.no_bools)
+    if isinstance(contract, (_PllNoneContract, _PllAnyContract)):
+        return type(contract)
+    if isinstance(contract, _PllItemsContract):
+        return ("items", contract.kind, _pll_check_key(contract.item, False))
+    if isinstance(contract, _PllUnionContract):
+        return ("union",) + tuple(_pll_check_key(member, False) for member in contract.members)
+    return id(contract)
+
+
+def _pll_checking(contract, blame, layer):
+    """The check of `contract`, or None for one that takes anything."""
+    check = _PllLayerCheck(contract, blame, layer)
+    return None if check.key is _PllAnyContract else check
+
+
+def _pll_collapsed(function, contract, blame):
+    """`function` under one more `Callable[[...], R]` layer, as Collapsible
+    Contracts merges them (Feltey et al., OOPSLA 2018), keeping each check's
+    order and blame: the layers' arguments are checked outermost first and
+    their results innermost first, in one call rather than one call each.
+    A check is dropped where an equal flat check on the same argument, or on
+    the result, runs before it with no check between that changes that
+    value; it could never be the one to fail. A layer left with no checks
+    goes, so a function passed on through the same parameters keeps a
+    bounded number of layers however many times it crosses them."""
+    arity = None if contract.params is None else len(contract.params)
+    held = getattr(function, "__pll_collapsed__", None)
+    if held is not None and held[0] is function and held[1] == arity:
+        base, layers = held[2], held[3]
+    else:
+        base, layers = function, ()
+    args = [_pll_checking(param, blame.swapped(step), blame) for param, step in getattr(contract, "positional", ())]
+    result = _pll_checking(contract.result, blame.into(("result", None, contract.result.written)), blame)
+    kept = [list(older_args) for older_args, _ in layers]
+    for position, check in enumerate(args):
+        if check is None or not check.flat:
+            continue
+        for older_args in kept:
+            older = older_args[position]
+            if older is None:
+                continue
+            if not older.flat:
+                break
+            if older.key == check.key:
+                older_args[position] = None
+    if result is not None and result.flat:
+        for _, older in layers:
+            if older is None:
+                continue
+            if not older.flat:
+                break
+            if older.key == result.key:
+                result = None
+                break
+    kept = [(tuple(older_args), older_result) for older_args, (_, older_result) in zip(kept, layers)]
+    layers = ((tuple(args), result),) + tuple(layer for layer in kept if any(layer[0]) or layer[1] is not None)
+
+    def contracted(*args, **kwargs):
+        if arity is not None and not kwargs and len(args) == arity:
+            args = list(args)
+            for layer_args, _ in layers:
+                for position, check in enumerate(layer_args):
+                    if check is not None:
+                        args[position] = check.apply(args[position])
+        _PLL_CALLS.append(_PllCall(None))
+        try:
+            value = base(*args, **kwargs)
+        finally:
+            _PLL_CALLS.pop()
+        for _, check in reversed(layers):
+            if check is not None:
+                value = check.apply(value)
+        return value
+
+    for attribute in _PLL_WRAPPER_ASSIGNMENTS:
+        try:
+            setattr(contracted, attribute, getattr(function, attribute))
+        except (AttributeError, TypeError):
+            pass
+    contracted.__wrapped__ = base
+    contracted.__pll_collapsed__ = (contracted, arity, base, layers)
     return contracted
 
 
@@ -1584,13 +1717,18 @@ def _pll_ref(value, party, line, column):
     return wrapper
 
 
+#: The calling lines a method keeps its obligations for (`_pll_boundary`).
+_PLL_CALL_SITES = 64
+
+
 def _pll_boundary(function, definition):
     """What a contracted `def`'s name is given: the function under its
     contract for code that reaches it with no reference of its own to make
     the obligation - a method, called through its object; a file at `#level
     raw` calling into one that checks. Each call makes the obligation with
     the code that made it, as Racket's module boundary does with whoever
-    imports what it provides."""
+    imports what it provides - once for each line that calls."""
+    calls = {}
 
     def contracted(*args, **kwargs):
         # The student's code that made the call, past any of PLL's own - a
@@ -1598,12 +1736,18 @@ def _pll_boundary(function, definition):
         caller = _sys._getframe(1)
         while caller.f_back is not None and not _pll_is_students(caller.f_code.co_filename):
             caller = caller.f_back
-        taker = _pll_party_of_code(caller.f_code)
-        blame = _PllBlame(
-            definition.party, taker, definition.party, (), (caller.f_code.co_filename, caller.f_lineno, None),
-            definition.level,
-        )
-        return _pll_wrapped(function, definition, blame)(*args, **kwargs)
+        # By the code's identity: code objects of two files compare equal.
+        site = (id(caller.f_code), caller.f_lineno)
+        made = calls.get(site)
+        if made is None or made[0] is not caller.f_code:
+            if len(calls) >= _PLL_CALL_SITES:
+                calls.clear()
+            blame = _PllBlame(
+                definition.party, _pll_party_of_code(caller.f_code), definition.party, (),
+                (caller.f_code.co_filename, caller.f_lineno, None), definition.level,
+            )
+            made = calls[site] = (caller.f_code, _pll_wrapped(function, definition, blame))
+        return made[1](*args, **kwargs)
 
     for attribute in _PLL_WRAPPER_ASSIGNMENTS:
         setattr(contracted, attribute, getattr(function, attribute))
